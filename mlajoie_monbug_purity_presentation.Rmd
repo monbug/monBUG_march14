@@ -1,0 +1,681 @@
+---
+title: "VAF, CNA and tumour purity"
+author: "Mathieu Lajoie"
+date: '2018-03-14'
+output:
+  ioslides_presentation: 
+    smaller: yes
+  beamer_presentation: default
+  slidy_presentation: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(data.table)
+library(IRanges) # for splitAsList()
+
+# Load data for plots ####
+DP = fread("Data/TCGA_purity_estimates_CNA_VAF_ASCAT_ABSOLUTE_and_others.txt")
+
+
+# VAF and CNA functions ####
+
+expected_VAF = function(p, mc = 1, CN_T = 2, CN_N = 2){
+  (mc * p) / (CN_T * p + CN_N * (1 - p) )
+}
+
+expected_purity = function(VAF, mc = 1, CN_T = 2, CN_N = 2){ 
+  CN_N * VAF/(mc + VAF * (CN_N - CN_T)) 
+}
+
+expected_log2R = function(p, CN_T = 2, CN_N = 2, CN_R = 2){
+  log2( CN_T * p + CN_N * (1-p) ) - log2( CN_R * p + CN_N * (1-p) )
+}
+
+expected_purity_from_log2R = function(log2R, CT, CN = 2, CTR = 2){ 
+  ((2^{log2R} - 1) * CN) / (CT - CN + 2^{log2R} * (CN - CTR)) 
+}
+
+
+# Plotting functions ####
+
+add_vaf = function(mc, CN_T, col = 1, purity = (0:10)/10){
+  vaf = expected_VAF(purity, mc, CN_T)
+  points(purity, vaf, ylim=c(0,1), xlim=c(0,1), type='l', col = col ,lty = 2)
+  text(purity, vaf, labels = paste0(mc,":",CN_T),pos = 2,cex=0.7,col=col)
+}
+
+add_purity = function(mc, CN_T, col = 1, vaf = (0:10)/10){
+  purity = expected_purity(vaf, mc, CN_T)
+  points(vaf, purity, ylim=c(0,1), xlim=c(0,1), type='l', col = col ,lty = 2)
+  text(vaf, purity, labels = paste0(mc,":",CN_T),pos = 2,cex=0.7,col=col)
+}
+
+red = rgb(1,0,0,0.3)
+green = rgb(0,1,0,0.3)
+blue = rgb(0,0,1,0.3)
+grey = rgb(0,0,0,0.3)
+
+DP$
+
+plot_xy = function(x, y, col = grey,  xname = deparse(substitute(x)), yname = deparse(substitute(y)),xlim=0:1,ylim=0:1,ccex=1.5){
+  xlab = gsub("_"," ",gsub("^.*\\$","",xname))
+  ylab = gsub("_"," ",gsub("^.*\\$","",yname))
+  plot(x, y, xlab = xlab, ylab = ylab, col = col, xlim = xlim, ylim = ylim,pch=20)
+  grid()
+  abline(a=0,b=1,lwd=2)
+  fit = lm(y~x)
+  abline(fit,col="red",lwd=2)
+  p = cor(x, y, use = "p")
+  text(0.5*max(xlim), 0.95*max(ylim),paste("cor =", signif(p,digits = 3)),ccex,col="red")
+}
+
+plot_xy_smooth = function(x, y, xname = deparse(substitute(x)),yname = deparse(substitute(y)),xlim=0:1,ylim=0:1,ccex=1.5){
+  xlab = gsub("_"," ",gsub("^.*\\$","",xname))
+  ylab = gsub("_"," ",gsub("^.*\\$","",yname))
+  smoothScatter(x, y, xlab = xlab, ylab = ylab, xlim = xlim, ylim = ylim);grid()
+  abline(a=0,b=1,lwd=2)
+  fit = lm(y~x)
+  abline(fit,col="red",lwd=2)
+  p = cor(x, y, use = "p")
+  text(0.5*max(xlim), 0.95*max(ylim), paste("cor =", signif(p,digits = 3)),ccex,col="red")
+}
+
+# TESTS
+#plot_xy(DP$purity_absolute_SKCM, DP$purity_ascat)
+#plot_xy_smooth(DP$purity_absolute_SKCM, DP$purity_ascat)
+
+# New col
+DP$purity_ascat_not1 = ifelse(DP$purity_ascat==1, NA, DP$purity_ascat)
+```
+
+## Outline
+* Intro
+* Genomic approaches for purity estimation
+    * Variant allele freq. + copy number profiles
+    * Methylation
+    * RNA-seq
+* Understanding relationship between VAF, purity and CN
+* Getting your own purity estimates (when necessary)
+* How to use purity estimates in genomic analyses
+
+## Tumor purity
+* Infiltrating lymphocytes and stromal cells are ubiquitous in solid tumor samples
+* These reduce "tumor signal" in genomic analyses and can introduce bias 
+* TCGA QC threshold for inclusion was >60% tumor purity (visual counting)
+* According to ASCAT estimates (COSMIC DB), only 46% of samples meet it.
+
+
+```{r}
+
+med_purity = sort(median(splitAsList(DP$purity_ascat, DP$cancer),na.rm = TRUE))
+DP$cancers = factor(DP$cancer,levels = names(med_purity))
+
+boxplot(DP$purity_ascat ~ DP$cancers,las=2,col = "grey", ylim=0:1, main = "TCGA purity distribution (n=7372)",ylab="purity (ASCAT)")
+grid()
+abline(h=0.6,col="red",lty=2,lwd=2)
+
+# table(is.na(DP$purity_ascat))
+# prop.table(table(DP$purity_ascat > 0.6))
+
+```
+
+
+## Purity from VAF + CN
+Well known softwares:
+
+- ABSOLUTE (Carter et al. 2012)
+- ASCAT (Van Loo et al. 2010)
+
+What they do:
+
+- Assign absolute copy numbers to each genomic region
+- Implies estimating purity (cancer cell fraction)
+- Can also estimate variant copy numbers (ABSOLUTE)
+
+Requires:
+
+- log2R (from snp arrays, WGS, WEX)
+- BAF (Germline AF, snp arrays or WGS)
+- VAF (WXS,WGS)
+
+Cons:
+
+- Computationally intensive (hours per sample)
+- Multiple solutions are possibles (manual selection)
+
+
+## ABSOLUTE vs ASCAT (SKCM only)
+```{r}
+
+col = ifelse(abs(DP$ploidy_absolute_SKCM - DP$ploidy_ascat)>0.5,red,green)
+
+plot_xy(DP$purity_absolute_SKCM, DP$purity_ascat, col=col)
+
+legend("bottomright",legend=c("no","yes"),fill = c(2:3),cex=0.75,title = "Similar ploidy")
+
+```
+
+## ABSOLUTE vs ASCAT (SKCM only)
+```{r}
+
+col = c(grey,green,red)[DP$doublings_absolute_SKCM+1]
+
+plot_xy(DP$ploidy_absolute_SKCM, DP$ploidy_ascat, col = col, ylim = c(1,6),xlim=c(1,6))
+
+legend("bottomright",legend=c("0 WGD","1 WGD", "2 WGD"),fill = c(grey,green,red),cex=0.75,title = "ABSOLUTE")
+
+```
+
+## ABSOLUTE vs ASCAT (1220 samples)
+
+```{r}
+
+  par(mfrow=c(1,2))
+
+  sel = !is.na(DP$purity_ascat) & !is.na(DP$purity_absolute_infinium)
+  #sum(sel)
+  
+  purity_absolute = DP$purity_absolute_infinium[sel]
+  purity_ascat = DP$purity_ascat[sel]
+  purity_ascat_not1 = DP$purity_ascat_not1[sel]
+  
+  plot_xy_smooth(purity_absolute, purity_ascat, xlim=0:1, ylim=0:1)
+  plot_xy_smooth(purity_absolute, purity_ascat_not1, xlim=0:1, ylim=0:1)
+  
+  par(mfrow=c(1,1))
+  
+```
+
+## Methylation (Zhang et al. 2015)
+
+* Use beta values [0,1]
+
+```{r}
+
+train_samples = (!is.na(DP$purity_infinium)) & (!is.na(DP$purity_absolute_infinium))
+#table(train_samples)
+
+purity_absolute = DP$purity_absolute_infinium
+purity_infinium = DP$purity_infinium
+
+plot_xy_smooth(purity_absolute, purity_infinium)
+
+```
+* Results shown on training samples
+
+## ASCAT vs Infinium (5689 samples)
+```{r}
+#table(!is.na(DP$purity_ascat) & !is.na(DP$purity_infinium))
+
+xlab = "purity from ASCAT" 
+ylab = "purity from Infinium" 
+
+col = ifelse(DP$ploidy_ascat >2.5 ,green, red)
+plot_xy_smooth(DP$purity_ascat, DP$purity_infinium)
+
+#plot_xy(DP$purity_ascat, DP$purity_infinium, col=col)
+#legend("bottomright",legend=c(">2.5","<2.5"),fill = c(green,blue), cex=0.75,title = "ASCAT ploidy")
+```
+
+* Comparison includes several new samples
+
+## ASCAT vs Infinium (5689 samples)
+
+```{r}
+
+#table(!is.na(DP$purity_ascat) & !is.na(DP$purity_infinium))
+
+xlab = "purity from ASCAT" 
+ylab = "purity from Infinium" 
+
+col = ifelse(DP$ploidy_ascat >2.5,red,green)
+plot_xy(DP$purity_ascat, DP$purity_infinium,col=col)
+legend("bottomright",legend=c(">2.5","<2.5"),fill = c(red,green), cex=0.75,title = "ASCAT ploidy")
+```
+Infinium measure "cancer DNA fraction" rather than "cancer cell fraction"
+
+## ASCAT vs Infinium (5689 samples)
+
+```{r}
+
+infinium_train_set = !is.na(DP$purity_infinium) & !is.na(DP$purity_absolute_infinium)
+
+col = ifelse(infinium_train_set,green,blue)  
+
+par(mfrow=c(2,3))
+for(cancer in c("BRCA","UCEC","COAD","THCA","LGG","PRAD")){
+  sel = DP$cancer == cancer & DP$purity_ascat != 1
+  purity_infinium = DP$purity_infinium[sel]
+  purity_ascat = DP$purity_ascat[sel]
+#  plot(purity_ascat, purity_infinium, xlim=0:1, ylim=0:1, main=cancer, col = col[sel])
+  plot_xy(purity_ascat, purity_infinium, col = col[sel])
+  title(cancer)
+}
+par(mfrow=c(1,1))
+
+```
+
+* Worst case scenarios (new cancer types)
+
+## RNA-seq
+
+Performs poorly ...
+
+* Expression is cancer specific (needs training)
+* Expression values not bounded + high variance
+* Expression vs purity is not linear
+* Expression is less correlated than beta values
+* Expression values can come from different pipelines
+
+## VAF vs purity and copy number
+
+Given a pen and a piece of paper, it is relatively straightforward to get the expected VAF as a function of purity and copy number:
+
+
+
+```{r VAF, include=TRUE, echo = TRUE}
+expected_VAF = function(p, mc = 1, CN_T = 2, CN_N = 2){
+  (mc * p) / (CN_T * p + CN_N * (1 - p) )
+}
+```
+
+- p : purity (cancer cell fraction)
+- mc : mutated copy number
+- CN_T : copy number in tumor
+- CN_N : copy number in normal
+
+
+
+## Simple diploid case
+
+```{r}
+
+xlab = "Purity (tumour cell fraction)"
+title = ""
+ccex = 1
+
+plot(0, xlim=c(0,1), ylim=c(0,1), ylab="Expected VAF", main=title, xlab=xlab, yaxs="i", xaxs="i",col=0);grid()
+add_vaf(1,2)
+add_vaf(2,2)
+
+axis(side = 4,at = c(1/2,1), labels = c("1/2","1"), tick = TRUE,lwd.ticks = 1, cex.axis=0.75)
+
+```
+
+## With a chromosome loss
+
+```{r VAF_plot_1}
+
+
+xlab = "Purity (tumour cell fraction)"
+title = ""
+ccex = 1
+
+plot(0, xlim=c(0,1), ylim=c(0,1), ylab="Expected VAF", main=title, xlab=xlab, yaxs="i", xaxs="i",col=0);grid()
+add_vaf(1,2)
+add_vaf(2,2)
+add_vaf(1,1,col="blue")
+
+axis(side = 4,at = c(1/2,1), labels = c("1/2","1"), tick = TRUE,lwd.ticks = 1, cex.axis=0.75)
+
+```
+
+## With a chromosome gain
+```{r}
+
+xlab = "Purity (tumour cell fraction)"
+title = ""
+ccex = 1
+
+plot(0, xlim=c(0,1), ylim=c(0,1), ylab="Expected VAF", main=title, xlab=xlab, yaxs="i", xaxs="i",col=0);grid()
+add_vaf(1,2)
+add_vaf(2,2)
+add_vaf(1,1,col="blue")
+add_vaf(1,3,col="orange")
+add_vaf(2,3,col="orange")
+add_vaf(3,3,col="orange")
+axis(side = 4,at = c(1/3,1/2,2/3,1), labels = c("1/3","1/2","2/3","1"), 
+     tick = TRUE,lwd.ticks = 1, cex.axis = 0.75)
+```
+
+## With genome doubling (4 copies)
+
+```{r}
+
+xlab = "Purity (tumour cell fraction)"
+title = ""
+ccex = 1
+
+plot(0, xlim=c(0,1), ylim=c(0,1), ylab="Expected VAF", main=title, xlab=xlab, yaxs="i", xaxs="i",col=0);grid()
+add_vaf(1,2)
+add_vaf(2,2)
+add_vaf(1,1,col="blue")
+add_vaf(1,3,col="orange")
+add_vaf(2,3,col="orange")
+add_vaf(3,3,col="orange")
+add_vaf(1,4,col="red")
+add_vaf(2,4,col="red")
+add_vaf(3,4,col="red")
+add_vaf(4,4,col="red")
+axis(side = 4,at = c(1/4, 1/3, 1/2, 2/3, 3/4, 1), 
+     labels = c("1/4","1/3","1/2","2/3","3/4","1"), 
+     tick = TRUE,lwd.ticks = 1, cex.axis=0.5)
+```
+
+
+## Purity vs VAF and copy number
+Using a bit of elementary algebra, we can express expected purity as a function of VAF and copy number :
+
+```{r,echo = TRUE}
+expected_purity = function(VAF, mc = 1, CN_T = 2, CN_N = 2){ 
+  CN_N * VAF/(mc + VAF * (CN_N - CN_T)) 
+  }
+```
+
+- VAF
+- mc : mutated copy number
+- CN_T : copy number in tumor
+- CN_N : copy number in normal
+
+## Purity vs VAF and copy number
+```{r}
+plot(0, xlim=c(0,1), ylim=c(0,1), ylab="Expected purity", main=title, xlab="VAF", yaxs="i", xaxs="i",col=0);grid()
+add_purity(1,2)
+add_purity(2,2)
+add_purity(1,1,"blue")
+add_purity(1,3,"orange")
+add_purity(2,3,"orange")
+add_purity(3,3,"orange")
+```
+
+## Log2R vs copy number and purity
+
+- p : purity
+- CN_T : copy number in tumor
+- CN_N : copy number in normal
+- CN_R : reference copy number in tumor
+
+```{r,echo = TRUE}
+
+expected_log2R = function(p, CN_T = 2, CN_N = 2, CN_R = 2){
+  log2( CN_T * p + CN_N * (1-p) ) - log2( CN_R * p + CN_N * (1-p) )
+}
+
+expected_purity_from_log2R = function(log2R, CT, CN = 2, CTR = 2){ 
+  ((2^{log2R} - 1) * CN) / (CT - CN + 2^{log2R} * (CN - CTR)) 
+}
+```
+
+## Simple diploid case
+```{r}
+purity = (0:10)/10
+
+plot(0, 0, ylim=c(-3,2), xlim=c(0,1), col=0, ylab="log2R",main="log2R vs Copy Number (2N)",xlab=xlab,yaxs="i",xaxs="i");grid()
+
+abline(h=0,col="grey",lwd=3)
+
+for(i in 0:6){
+  col = ifelse(i<2,"blue",ifelse(i==2,"black","red"))
+  points(purity,expected_log2R(purity,i,2,2),
+  col=col,cex=0.75,type='b',pch=as.character(i))
+}
+abline(a=0,b=-1,col="green")
+```
+
+## Median centered on 3 copies
+```{r}
+purity = (0:10)/10
+
+plot(0, 0, ylim=c(-3,2), xlim=c(0,1), col=0, ylab="log2R",main="log2R vs Copy Number (3N)",xlab=xlab,yaxs="i",xaxs="i");grid()
+
+abline(h=0,col="grey",lwd=3)
+
+for(i in 0:6){
+  col = ifelse(i<2,"blue",ifelse(i==2,"black","red"))
+  points(purity,expected_log2R(purity,i,2,3),
+  col=col,cex=0.75,type='b',pch=as.character(i))
+}
+```
+
+## Genome doubling
+```{r}
+purity = (0:10)/10
+
+plot(0, 0, ylim=c(-3,2), xlim=c(0,1), col=0, ylab="log2R",main="log2R vs Copy Number (4N)",xlab=xlab,yaxs="i",xaxs="i");grid()
+
+abline(h=0,col="grey",lwd=3)
+
+for(i in 0:6){
+  col = ifelse(i<2,"blue",ifelse(i==2,"black","red"))
+  points(purity,expected_log2R(purity,i,2,4),
+  col=col,cex=0.75,type='b',pch=as.character(i))
+}
+```
+
+
+## Sample's median VAF (n = 10102)
+Most variants are heterozyguous (1:2)
+```{r}
+par(mfrow=c(1,2))
+hist(DP$med_VAF,breaks=100,col="grey",main="",xlab = "median sample VAF")
+abline(v=0.5,lty=2)
+#table(is.na(DP$med_VAF))
+plot(0, xlim=c(0,1), ylim=c(0,1), ylab="Expected purity", main=title, xlab="VAF", yaxs="i", xaxs="i",col=0);grid()
+add_purity(1,2)
+add_purity(2,2)
+add_purity(1,1,"blue")
+add_purity(1,3,"orange")
+add_purity(2,3,"orange")
+add_purity(3,3,"orange")
+abline(v=0.5,lty=2)
+```
+
+## Using median VAF (1220 samples)
+purity = min(median(VAF) * 2 , 1)
+```{r}
+
+  par(mfrow=c(1,2))
+
+  sel = !is.na(DP$purity_ascat) & !is.na(DP$purity_absolute_infinium)
+  #sum(sel)
+  
+  purity_absolute = DP$purity_absolute_infinium[sel]
+  purity_ascat = DP$purity_ascat[sel]
+  purity_ascat_not_1 = DP$purity_ascat[sel]
+  purity_ascat_not_1[purity_ascat_not_1==1] = NA
+  
+  purity_VAF = DP$purity_medVAF[sel]
+
+#  plot(purity_ascat, purity_VAF, xlim=0:1, ylim=0:1, main=cancer, col = col, cex=0.5)
+  ccex = 1.3
+  p = cor(purity_VAF, purity_ascat_not_1,use = "p")
+  smoothScatter(purity_VAF, purity_ascat_not_1, xlim=0:1, ylim=0:1)
+  text(0.5,0.8,paste("cor =", signif(p,digits = 2)),ccex,col="red")
+  abline(a=0,b=1)
+
+  p = cor(purity_VAF, purity_absolute, use = "p")
+  smoothScatter(purity_VAF, purity_absolute, xlim=0:1, ylim=0:1)
+  text(0.5,0.8,paste("cor =", signif(p,digits = 2)),ccex,col="red")
+  abline(a=0,b=1)
+  
+```
+
+* Same samples than for ABSOLUTE vs ASCAT comparison
+
+## Using CNA
+```{r}
+par(mfrow=c(1,2))
+
+hist(DP$min_arm_log2R,breaks = 100,xlab = "min log2R by sample (arm median)",main="",col="grey")
+abline(v=-c(1,0.2),lty=2)
+
+purity = (0:10)/10
+
+plot(0, 0, ylim=c(-3,2), xlim=c(0,1), col=0, ylab="log2R",main="log2R vs Copy Number (2N)",xlab=xlab,yaxs="i",xaxs="i");grid()
+
+abline(h=0,col="grey",lwd=3)
+
+for(i in 0:6){
+  col = ifelse(i<2,"blue",ifelse(i==2,"black","red"))
+  points(purity,expected_log2R(purity,i,2,2),
+  col=col,cex=0.75,type='b',pch=as.character(i))
+}
+abline(h=-c(1,0.2),lty=2)
+```
+
+
+## Using CNA (1220 samples)
+
+```{r}
+
+  par(mfrow=c(1,2))
+
+  purity_ascat = DP$purity_ascat
+  purity_ascat_not_1 = DP$purity_ascat
+  purity_ascat_not_1[purity_ascat_not_1==1] = NA
+  purity_cn_loss = DP$purity_cn_loss
+
+  ccex = 1.3
+  plot_xy_smooth(purity_cn_loss, purity_ascat_not_1)
+#  p = cor(purity_cn_loss, purity_ascat_not_1,use = "p")
+#  smoothScatter(purity_cn_loss, purity_ascat_not_1, xlim=0:1, ylim=0:1)
+#  text(0.5,0.8,paste("cor =", signif(p,digits = 2)),ccex,col="red")
+#  abline(a=0,b=1)
+
+  sel = purity_cn_loss > 0.2
+  
+  p = cor(purity_cn_loss[sel], purity_ascat_not_1[sel],use = "p")
+  smoothScatter(purity_cn_loss[sel], purity_ascat_not_1[sel], xlim=0:1, ylim=0:1)
+  text(0.5,0.8,paste("cor =", signif(p,digits = 2)),ccex,col="red")
+  abline(a=0,b=1)
+  
+  par(mfrow=c(1,2))
+
+```
+
+* Same samples than for ASCAT vs ABSOLUTE comparison
+
+## VAF and CNA (1220 samples)
+
+- purity_cna = (1 - 2^{log2R}) * 2 # If > 0.2
+- purity_cna_vaf = mean(purity_cna, purity_VAF)
+
+```{r}
+
+
+  par(mfrow=c(1,2))
+
+  sel = !is.na(DP$purity_ascat) & !is.na(DP$purity_absolute_infinium)
+  #sum(sel)
+  purity_absolute = DP$purity_absolute_infinium[sel]
+  purity_ascat = DP$purity_ascat[sel]
+  purity_ascat_not_1 = DP$purity_ascat[sel]
+  purity_ascat_not_1[purity_ascat_not_1==1] = NA
+  
+  purity_VAF_CNA = DP$purity_cna_vaf[sel]
+
+#  plot(purity_ascat, purity_VAF, xlim=0:1, ylim=0:1, main=cancer, col = col, cex=0.5)
+  ccex = 1.3
+  p = cor(purity_VAF_CNA, purity_ascat_not_1,use = "p")
+  smoothScatter(purity_VAF_CNA, purity_ascat_not_1, xlim=0:1, ylim=0:1)
+  text(0.5,0.8,paste("cor =", signif(p,digits = 2)),ccex,col="red")
+  abline(a=0,b=1)
+
+  p = cor(purity_VAF_CNA, purity_absolute, use = "p")
+  smoothScatter(purity_VAF_CNA, purity_absolute, xlim=0:1, ylim=0:1)
+  text(0.5,0.8,paste("cor =", signif(p,digits = 2)),ccex,col="red")
+  abline(a=0,b=1)
+  
+```
+
+* Same samples than for ASCAT vs ABSOLUTE comparison
+
+## VAF and CNA (7372 samples)
+```{r}
+
+  par(mfrow=c(1,2))
+
+  sel = !is.na(purity_ascat)
+  
+  purity_absolute = DP$purity_absolute_infinium[sel]
+  purity_ascat = DP$purity_ascat[sel]
+  purity_ascat_not_1 = DP$purity_ascat[sel]
+  purity_ascat_not_1[purity_ascat_not_1==1] = NA
+  purity_VAF_CNA = DP$purity_cna_vaf[sel]
+
+  ccex = 1.3
+  p = cor(purity_VAF_CNA, purity_ascat,use = "p")
+  smoothScatter(purity_VAF_CNA, purity_ascat, xlim=0:1, ylim=0:1)
+  text(0.5,0.8,paste("cor =", signif(p,digits = 2)),ccex,col="red")
+  abline(a=0,b=1)
+
+  ccex = 1.3
+  p = cor(purity_VAF_CNA, purity_ascat_not_1,use = "p")
+  smoothScatter(purity_VAF_CNA, purity_ascat_not_1, xlim=0:1, ylim=0:1)
+  text(0.5,0.8,paste("cor =", signif(p,digits = 2)),ccex,col="red")
+  abline(a=0,b=1)
+
+```
+
+* All samples available for ASCAT
+
+## Difference with ASCAT distribution (7365 samples)
+Difference < 25% for 89% of samples
+```{r}
+#diff = (DP$purity_medVAF - DP$purity_ascat)
+diff = (DP$purity_cna_vaf - DP$purity_ascat)
+DP$cancers = factor(DP$cancer,levels = names(med_purity))
+
+#table(is.na(diff))
+#prop.table(table(abs(diff)<0.25))
+boxplot(diff ~ DP$cancers,las = 2,col = "grey", ylim = c(-1,1))
+grid()
+abline(h=c(-.25,.25),col="red",lty=2)
+#cancers = factor(DP$cancer,levels = names(med_purity))
+#table(DP$cancer)
+```
+
+## Using methylation (SKCM only)
+
+Two probes most highly correlated with absolute purity
+
+```{r}
+par(mfrow=c(1,2))
+
+col = DP$doublings_absolute_SKCM + 1
+
+plot_xy(DP$purity_absolute_SKCM,DP$cg05630725_SOX5_beta, col = col)
+plot_xy(DP$purity_absolute_SKCM, DP$cg14112754_GP5_beta, col = col)
+
+```
+
+## Using methylation (SKCM only)
+
+* Simple linear model on best two probes
+
+```{r}
+par(mfrow=c(1,2))
+
+col = DP$doublings_absolute_SKCM + 1
+
+# Simple model
+fit =  lm(DP$purity_absolute_SKCM ~ DP$cg05630725_SOX5_beta + DP$cg14112754_GP5_beta)
+
+DP$purity_methyl_fit = DP$cg05630725_SOX5_beta * coef(fit)[2] + DP$cg14112754_GP5_beta * coef(fit)[3] + coef(fit)[1]
+
+plot_xy(DP$purity_absolute_SKCM, DP$purity_methyl_fit, col = col)
+plot_xy(DP$purity_ascat_not1, DP$purity_methyl_fit, col = col)
+```
+
+
+## TCGA purity distribution (10102 samples)
+```{r}
+med_purity = sort(median(splitAsList(DP$purity_cna_vaf,DP$cancer),na.rm = TRUE))
+DP$cancers = factor(DP$cancer,levels = names(med_purity))
+#table(is.na(DP$purity_cna_vaf))
+boxplot(DP$purity_cna_vaf ~ DP$cancers,las=2,col = "grey", ylim=0:1, main = "TCGA purity distribution (n=10113)")
+grid()
+abline(h=0.6,col="red")
+```
