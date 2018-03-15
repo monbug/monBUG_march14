@@ -1,3 +1,3 @@
-# monBUG_march14
+# Purity estimation from VAF and CNA
 
-contact:mathieu.lajoie@gmail.com
+contact: mathieu.lajoie@gmail.com
