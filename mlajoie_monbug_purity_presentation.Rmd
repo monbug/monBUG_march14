@@ -57,7 +57,6 @@ green = rgb(0,1,0,0.3)
 blue = rgb(0,0,1,0.3)
 grey = rgb(0,0,0,0.3)
 
-DP$
 
 plot_xy = function(x, y, col = grey,  xname = deparse(substitute(x)), yname = deparse(substitute(y)),xlim=0:1,ylim=0:1,ccex=1.5){
   xlab = gsub("_"," ",gsub("^.*\\$","",xname))
